@@ -27,13 +27,12 @@ jobs:
 
       - name: Copy FFmpeg engine into the app
         run: |
-          mkdir -p www/ffmpeg
-          cp node_modules/@ffmpeg/ffmpeg/dist/umd/ffmpeg.js www/ffmpeg/
-          cp node_modules/@ffmpeg/ffmpeg/dist/umd/814.ffmpeg.js www/ffmpeg/
-          cp node_modules/@ffmpeg/util/dist/umd/index.js www/ffmpeg/util.js
-          cp node_modules/@ffmpeg/core/dist/umd/ffmpeg-core.js www/ffmpeg/
-          cp node_modules/@ffmpeg/core/dist/umd/ffmpeg-core.wasm www/ffmpeg/
-          ls -lh www/ffmpeg
+          mkdir -p www/ffmpeg/core-esm
+          cp -r node_modules/@ffmpeg/ffmpeg/dist/esm www/ffmpeg/ffmpeg-esm
+          cp -r node_modules/@ffmpeg/util/dist/esm www/ffmpeg/util-esm
+          cp node_modules/@ffmpeg/core/dist/esm/ffmpeg-core.js www/ffmpeg/core-esm/
+          cp node_modules/@ffmpeg/core/dist/esm/ffmpeg-core.wasm www/ffmpeg/core-esm/
+          ls -lh www/ffmpeg/*
 
       - name: Add Android platform
         run: |
