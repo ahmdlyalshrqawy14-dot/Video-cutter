@@ -4,8 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>قص نهاية الفيديو</title>
-<script src="ffmpeg/ffmpeg.js"></script>
-<script src="ffmpeg/util.js"></script>
 <style>
   *{box-sizing:border-box}
   body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Tahoma,sans-serif;background:#f4f5f7;color:#1b1f24;display:flex;justify-content:center;padding:20px}
@@ -59,7 +57,10 @@
   </div>
 </main>
 
-<script>
+<script type="module">
+import { FFmpeg } from './ffmpeg/ffmpeg-esm/index.js';
+import { fetchFile } from './ffmpeg/util-esm/index.js';
+
 const $ = id => document.getElementById(id);
 const mainFile = $('mainFile'), extraFile = $('extraFile'), cutEl = $('cut');
 const startBtn = $('startBtn'), bar = $('bar'), statusEl = $('status');
@@ -77,20 +78,19 @@ const errText = e => (e && e.message) ? e.message : String(e);
 
 async function getFF() {
   if (ffmpeg) return ffmpeg;
-  if (typeof FFmpegWASM === 'undefined' || typeof FFmpegUtil === 'undefined') {
-    throw new Error('ملفات المحرّك ناقصة (مجلد ffmpeg)');
+  const base = new URL('ffmpeg/core-esm/', location.href).href;
+  for (const fn of ['ffmpeg-core.js', 'ffmpeg-core.wasm']) {
+    const r = await fetch(base + fn);
+    if (!r.ok) throw new Error('الملف غير موجود: ' + fn + ' (' + r.status + ')');
   }
-  const { FFmpeg } = FFmpegWASM;
-  const { toBlobURL } = FFmpegUtil;
   const f = new FFmpeg();
   f.on('log', ({ message }) => { logBuf += message + '\n'; });
   f.on('progress', ({ progress }) => {
     if (progress >= 0 && progress <= 1) bar.value = progress;
   });
   await f.load({
-    coreURL: await toBlobURL('ffmpeg/ffmpeg-core.js', 'text/javascript'),
-    wasmURL: await toBlobURL('ffmpeg/ffmpeg-core.wasm', 'application/wasm'),
-    classWorkerURL: await toBlobURL('ffmpeg/814.ffmpeg.js', 'text/javascript')
+    coreURL: base + 'ffmpeg-core.js',
+    wasmURL: base + 'ffmpeg-core.wasm'
   });
   ffmpeg = f;
   return f;
@@ -160,7 +160,6 @@ startBtn.addEventListener('click', async () => {
   try {
     setStatus('جارٍ تحميل المحرّك...');
     const ff = await getFF();
-    const { fetchFile } = FFmpegUtil;
 
     setStatus('جارٍ قراءة الملفات...');
     const inMain = 'in0.' + getExt(file, 'mp4');
@@ -288,7 +287,7 @@ $('dl').addEventListener('click', async () => {
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 });
 
-// تحميل المحرّك أول ما يفتح التطبيق عشان نعرف لو فيه مشكلة بدري
+// تحميل المحرّك أول ما يفتح التطبيق
 (async () => {
   startBtn.disabled = true;
   setStatus('جارٍ تحميل المحرّك...');
