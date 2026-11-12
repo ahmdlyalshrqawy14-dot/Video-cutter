@@ -64,6 +64,7 @@ import { fetchFile } from './ffmpeg/util-esm/index.js';
 const $ = id => document.getElementById(id);
 const mainFile = $('mainFile'), extraFile = $('extraFile'), cutEl = $('cut');
 const startBtn = $('startBtn'), bar = $('bar'), statusEl = $('status');
+const MAX_BYTES = 25 * 1048576;   // الحد الأقصى في حالة إعادة الترميز الاضطرارية
 const AUDIO_BR = 128000;
 
 let ffmpeg = null, logBuf = '', outBlob = null;
@@ -75,6 +76,7 @@ extraFile.addEventListener('change', () => {
 
 const setStatus = t => statusEl.textContent = t;
 const errText = e => (e && e.message) ? e.message : String(e);
+const even = n => n - (n % 2);
 
 async function getFF() {
   if (ffmpeg) return ffmpeg;
@@ -104,7 +106,7 @@ function videoMeta(file) {
     const t = setTimeout(() => { URL.revokeObjectURL(url); rej(new Error('timeout')); }, 8000);
     v.onloadedmetadata = () => {
       clearTimeout(t);
-      const m = { duration: v.duration, w: v.videoWidth, h: v.videoHeight };
+      const m = { duration: v.duration };
       URL.revokeObjectURL(url);
       res(m);
     };
@@ -122,28 +124,48 @@ async function probe(ff, name) {
   logBuf = '';
   try { await ff.exec(['-i', name]); } catch (e) {}
   const l = logBuf;
-  const fpsM = l.match(/, (\d+(?:\.\d+)?) fps/);
-  let fps = fpsM ? parseFloat(fpsM[1]) : 30;
-  if (!(fps > 0) || fps > 60) fps = Math.min(fps || 30, 60);
+  const vLine = (l.match(/Stream #[^\n]*Video:[^\n]*/) || [''])[0];
+  const aLine = (l.match(/Stream #[^\n]*Audio:[^\n]*/) || [''])[0];
+
+  const vcodec = ((vLine.match(/Video:\s*([A-Za-z0-9_]+)/) || [])[1] || '').toLowerCase();
+  const acodec = ((aLine.match(/Audio:\s*([A-Za-z0-9_]+)/) || [])[1] || '').toLowerCase();
+  const sM = vLine.match(/ (\d{2,5})x(\d{2,5})/);
+  const fM = vLine.match(/(\d+(?:\.\d+)?) fps/);
+  let fps = fM ? parseFloat(fM[1]) : 30;
+  if (!(fps > 0)) fps = 30;
+  if (fps > 60) fps = 60;
+
   const dM = l.match(/Duration: (\d+):(\d+):(\d+(?:\.\d+)?)/);
   const duration = dM ? (+dM[1]) * 3600 + (+dM[2]) * 60 + parseFloat(dM[3]) : 0;
-  const sM = l.match(/Video:[^\n]*?[, ](\d{2,5})x(\d{2,5})/);
+
+  const srM = aLine.match(/(\d+) Hz/);
+  const mono = /mono/i.test(aLine);
+
+  // اتجاه الشاشة (دوران في ملفات الموبايل)
+  let cw = 0, m = l.match(/rotation of (-?\d+(?:\.\d+)?) degrees/);
+  if (m) cw = (((-Math.round(parseFloat(m[1]) / 90) * 90) % 360) + 360) % 360;
+  else { m = l.match(/rotate\s*:\s*(\d+)/); if (m) cw = (Math.round(parseInt(m[1]) / 90) * 90) % 360; }
+
   return {
-    audio: /Stream #[^\n]*Audio:/.test(l),
+    vcodec, acodec,
+    audio: !!aLine,
     fps: +fps.toFixed(3),
     duration,
     w: sM ? +sM[1] : 0,
-    h: sM ? +sM[2] : 0
+    h: sM ? +sM[2] : 0,
+    sr: srM ? +srM[1] : 44100,
+    ch: mono ? 1 : 2,
+    layout: mono ? 'mono' : 'stereo',
+    cw
   };
 }
 
-async function metaOf(file, pr) {
-  try {
-    const m = await videoMeta(file);
-    if (m.duration > 0 && isFinite(m.duration) && m.w > 0) return m;
-  } catch (e) {}
-  if (pr.duration > 0) return { duration: pr.duration, w: pr.w || 1280, h: pr.h || 720 };
-  throw new Error('تعذّر قراءة بيانات الفيديو');
+const rotFilter = cw => cw === 90 ? 'transpose=2,' : cw === 270 ? 'transpose=1,' : cw === 180 ? 'hflip,vflip,' : '';
+
+async function run(ff, args, msg) {
+  logBuf = '';
+  const code = await ff.exec(args);
+  if (code !== 0) throw new Error((msg || 'فشلت المعالجة') + ' (كود ' + code + ')');
 }
 
 startBtn.addEventListener('click', async () => {
@@ -156,81 +178,118 @@ startBtn.addEventListener('click', async () => {
   $('result').hidden = true;
   bar.hidden = false; bar.value = 0;
   const created = [];
+  const mk = n => { created.push(n); return n; };
 
   try {
     setStatus('جارٍ تحميل المحرّك...');
     const ff = await getFF();
 
-    setStatus('جارٍ قراءة الملفات...');
-    const inMain = 'in0.' + getExt(file, 'mp4');
-    await ff.writeFile(inMain, await fetchFile(file)); created.push(inMain);
+    setStatus('جارٍ قراءة الملف...');
+    const inMain = mk('in0.' + getExt(file, 'mp4'));
+    await ff.writeFile(inMain, await fetchFile(file));
     const pm = await probe(ff, inMain);
-    const meta = await metaOf(file, pm);
 
-    if (cut >= meta.duration) throw new Error('المدة المحذوفة أكبر من طول الفيديو');
-    const keep = meta.duration - cut;
-
-    // نفس معدل البت تقريبًا => نفس الحجم والجودة تقريبًا
-    const totalBps = file.size * 8 / meta.duration;
-    const vbr = Math.max(300000, totalBps - (pm.audio ? AUDIO_BR : 0));
-    const vk = Math.round(vbr / 1000);
-    const rate = ['-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
-      '-b:v', vk + 'k', '-maxrate', Math.round(vk * 1.5) + 'k', '-bufsize', (vk * 2) + 'k'];
-    const audioEnc = ['-c:a', 'aac', '-b:a', '128k'];
+    let duration = pm.duration;
+    if (!(duration > 0)) { try { duration = (await videoMeta(file)).duration; } catch (e) {} }
+    if (!(duration > 0)) throw new Error('تعذّر قراءة مدة الفيديو');
+    if (cut >= duration) throw new Error('المدة المحذوفة أكبر من طول الفيديو');
+    const keep = (duration - cut).toFixed(3);
 
     const extra = extraFile.files[0];
-    let args;
 
+    // ===== بدون لاحقة: قص فقط بدون إعادة ترميز =====
     if (!extra) {
-      args = ['-t', keep.toFixed(3), '-i', inMain, ...rate, ...(pm.audio ? audioEnc : ['-an']),
-        '-movflags', '+faststart', 'out.mp4'];
-    } else {
+      setStatus('جارٍ القص...');
+      await run(ff, ['-i', inMain, '-t', keep, '-map', '0:v:0', '-map', '0:a:0?',
+        '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', mk('out.mp4')]);
+    }
+    // ===== مع لاحقة =====
+    else {
       const isImg = extra.type.startsWith('image/');
-      const inExtra = 'in1.' + getExt(extra, isImg ? 'png' : 'mp4');
-      await ff.writeFile(inExtra, await fetchFile(extra)); created.push(inExtra);
+      const inExtra = mk('in1.' + getExt(extra, isImg ? 'png' : 'mp4'));
+      await ff.writeFile(inExtra, await fetchFile(extra));
 
-      const W = meta.w - (meta.w % 2), H = meta.h - (meta.h % 2);
+      const h264 = pm.vcodec === 'h264';
+      const aacCopy = pm.acodec === 'aac';
+      const sr = (pm.audio && aacCopy) ? pm.sr : 44100;
+      const ch = pm.audio ? pm.ch : 2;
+      const layout = ch === 1 ? 'mono' : 'stereo';
       const fps = pm.fps;
-      let extraDur, extraAudio = false, inputs;
+      const audioEnc = ['-c:a', 'aac', '-b:a', '128k', '-ar', String(sr), '-ac', String(ch)];
 
+      let part0Args, cwOut, sw, sh, dW, dH;
+
+      if (h264) {
+        // الفيديو الأصلي يتنسخ كما هو
+        cwOut = pm.cw;
+        sw = even(pm.w); sh = even(pm.h);
+        if (!sw || !sh) throw new Error('تعذّر قراءة مقاس الفيديو');
+        part0Args = ['-i', inMain, '-t', keep, '-map', '0:v:0', ...(pm.audio ? ['-map', '0:a:0'] : []),
+          '-c:v', 'copy', '-bsf:v', 'h264_mp4toannexb',
+          ...(pm.audio ? (aacCopy ? ['-c:a', 'copy'] : audioEnc) : ['-an']),
+          '-f', 'mpegts', mk('part0.ts')];
+      } else {
+        // حالة استثنائية: إعادة ترميز بحد أقصى للحجم
+        const swap = pm.cw === 90 || pm.cw === 270;
+        cwOut = 0;
+        sw = even(swap ? pm.h : pm.w); sh = even(swap ? pm.w : pm.h);
+        if (!sw || !sh) throw new Error('تعذّر قراءة مقاس الفيديو');
+        const target = Math.min(file.size, MAX_BYTES) * 8 / duration;
+        const vk = Math.max(300, Math.round((target - (pm.audio ? AUDIO_BR : 0)) * 0.9 / 1000));
+        setStatus('الفيديو بصيغة غير H.264، هيتم تحويله (أبطأ)...');
+        part0Args = ['-i', inMain, '-t', keep, '-map', '0:v:0', ...(pm.audio ? ['-map', '0:a:0'] : []),
+          '-vf', 'scale=' + sw + ':' + sh + ',format=yuv420p',
+          '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vk + 'k', '-maxrate', Math.round(vk * 1.5) + 'k', '-bufsize', (vk * 2) + 'k',
+          ...(pm.audio ? audioEnc : ['-an']),
+          '-f', 'mpegts', mk('part0.ts')];
+      }
+      const swapOut = cwOut === 90 || cwOut === 270;
+      dW = swapOut ? sh : sw; dH = swapOut ? sw : sh;   // مقاس العرض الفعلي
+
+      if (h264) setStatus('جارٍ قص الفيديو الأصلي (بدون إعادة ترميز)...');
+      bar.value = 0;
+      await run(ff, part0Args, 'فشل قص الفيديو');
+
+      // ----- تجهيز اللاحقة بنفس مواصفات الأصلي -----
+      setStatus('جارٍ تجهيز اللاحقة...');
+      const vf = `scale=${dW}:${dH}:force_original_aspect_ratio=decrease,pad=${dW}:${dH}:(ow-iw)/2:(oh-ih)/2,setsar=1,${rotFilter(cwOut)}fps=${fps},format=yuv420p`;
+      const vbrCap = Math.max(500, Math.round((file.size * 8 / duration) / 1000));
+      const venc = ['-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'high', '-crf', '23',
+        '-maxrate', vbrCap + 'k', '-bufsize', (vbrCap * 2) + 'k', '-g', String(Math.round(fps * 2)), '-r', String(fps)];
+
+      let extraDur, part1Args;
       if (isImg) {
         extraDur = Math.max(1, parseFloat($('imgDur').value) || 3);
-        inputs = ['-t', keep.toFixed(3), '-i', inMain,
-                  '-loop', '1', '-framerate', String(fps), '-t', extraDur.toFixed(3), '-i', inExtra];
+        part1Args = ['-loop', '1', '-framerate', String(fps), '-t', extraDur.toFixed(3), '-i', inExtra];
+        if (pm.audio) part1Args.push('-f', 'lavfi', '-t', extraDur.toFixed(3), '-i', `anullsrc=r=${sr}:cl=${layout}`);
+        part1Args.push('-map', '0:v', ...(pm.audio ? ['-map', '1:a'] : []), '-vf', vf, ...venc,
+          ...(pm.audio ? ['-c:a', 'aac', '-b:a', '128k', '-ar', String(sr), '-ac', String(ch)] : ['-an']),
+          '-f', 'mpegts', mk('part1.ts'));
       } else {
         const pe = await probe(ff, inExtra);
-        extraAudio = pe.audio;
         extraDur = pe.duration;
         if (!(extraDur > 0)) { try { extraDur = (await videoMeta(extra)).duration; } catch (e) {} }
         if (!(extraDur > 0)) throw new Error('تعذّر قراءة مدة الفيديو الإضافي');
-        inputs = ['-t', keep.toFixed(3), '-i', inMain, '-i', inExtra];
+        part1Args = ['-i', inExtra];
+        const needSilence = pm.audio && !pe.audio;
+        if (needSilence) part1Args.push('-f', 'lavfi', '-t', extraDur.toFixed(3), '-i', `anullsrc=r=${sr}:cl=${layout}`);
+        part1Args.push('-map', '0:v:0',
+          ...(pm.audio ? (needSilence ? ['-map', '1:a'] : ['-map', '0:a:0']) : []),
+          '-vf', vf, ...venc,
+          ...(pm.audio ? ['-c:a', 'aac', '-b:a', '128k', '-ar', String(sr), '-ac', String(ch)] : ['-an']),
+          '-f', 'mpegts', mk('part1.ts'));
       }
+      bar.value = 0;
+      await run(ff, part1Args, 'فشل تجهيز اللاحقة');
 
-      const useAudio = pm.audio || extraAudio;
-      const segV = (i, l) => `[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps},format=yuv420p,setpts=PTS-STARTPTS[${l}]`;
-      const segA = (i, l, has, d) => has
-        ? `[${i}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[${l}]`
-        : `anullsrc=r=44100:cl=stereo,atrim=0:${d.toFixed(3)},asetpts=PTS-STARTPTS[${l}]`;
-
-      const parts = [segV(0, 'v0'), segV(1, 'v1')];
-      if (useAudio) {
-        parts.push(segA(0, 'a0', pm.audio, keep), segA(1, 'a1', extraAudio, extraDur));
-        parts.push('[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]');
-      } else {
-        parts.push('[v0][v1]concat=n=2:v=1:a=0[v]');
-      }
-
-      args = [...inputs, '-filter_complex', parts.join(';'), '-map', '[v]',
-        ...(useAudio ? ['-map', '[a]', ...audioEnc] : ['-an']),
-        ...rate, '-movflags', '+faststart', 'out.mp4'];
+      // ----- الدمج بدون إعادة ترميز -----
+      setStatus('جارٍ الدمج...');
+      await ff.writeFile(mk('list.txt'), 'file part0.ts\nfile part1.ts\n');
+      await run(ff, ['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy',
+        ...(pm.audio ? ['-bsf:a', 'aac_adtstoasc'] : []),
+        ...(cwOut ? ['-metadata:s:v:0', 'rotate=' + cwOut] : []),
+        '-movflags', '+faststart', mk('out.mp4')], 'فشل الدمج');
     }
-
-    setStatus('جارٍ المعالجة... (قد تستغرق بعض الوقت)');
-    bar.value = 0;
-    logBuf = '';
-    const code = await ff.exec(args);
-    if (code !== 0) throw new Error('فشلت المعالجة (كود ' + code + ')');
-    created.push('out.mp4');
 
     const data = await ff.readFile('out.mp4');
     outBlob = new Blob([data.buffer], { type: 'video/mp4' });
