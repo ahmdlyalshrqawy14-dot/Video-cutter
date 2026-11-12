@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>قص نهاية الفيديو</title>
+<script src="ffmpeg/ffmpeg.js"></script>
+<script src="ffmpeg/util.js"></script>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Tahoma,sans-serif;background:#f4f5f7;color:#1b1f24;display:flex;justify-content:center;padding:20px}
+  main{width:100%;max-width:460px;background:#fff;border-radius:16px;padding:22px;box-shadow:0 4px 18px rgba(0,0,0,.08)}
+  h1{font-size:1.3rem;margin:0 0 18px;text-align:center}
+  label{display:block;margin-bottom:14px;font-size:.95rem;font-weight:600}
+  label small{font-weight:400;color:#667}
+  input[type=file],input[type=number],input[type=text]{display:block;width:100%;margin-top:6px;padding:9px;border:1px solid #ccd;border-radius:8px;font-size:1rem;background:#fff}
+  button{width:100%;padding:12px;border:0;border-radius:10px;background:#2563eb;color:#fff;font-size:1.05rem;font-weight:700;cursor:pointer}
+  button:disabled{background:#9ab;cursor:not-allowed}
+  progress{width:100%;margin-top:12px;height:12px}
+  #status{min-height:1.4em;margin:10px 0 0;font-size:.9rem;color:#445;text-align:center}
+  #result{margin-top:16px;border-top:1px solid #e3e5e8;padding-top:16px}
+  video{width:100%;border-radius:10px;background:#000;margin-bottom:12px}
+  #dl{background:#16a34a}
+  #sizes{font-size:.85rem;color:#556;text-align:center;margin:10px 0 0}
+  [hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <h1>✂️ قص نهاية الفيديو</h1>
+
+  <label>١) اختر الفيديو
+    <input type="file" id="mainFile" accept="video/*">
+  </label>
+
+  <label>٢) احذف آخر كام ثانية؟ <small>(من 2 إلى 10 — مثال: 3.8)</small>
+    <input type="number" id="cut" min="2" max="10" step="0.1" value="2">
+  </label>
+
+  <label>٣) إضافة لاحقة في النهاية <small>(اختياري — فيديو أو صورة)</small>
+    <input type="file" id="extraFile" accept="video/*,image/*">
+  </label>
+
+  <label id="imgDurBox" hidden>مدة ظهور الصورة (ثانية)
+    <input type="number" id="imgDur" min="1" max="30" step="0.5" value="3">
+  </label>
+
+  <button id="startBtn">ابدأ</button>
+  <progress id="bar" max="1" value="0" hidden></progress>
+  <p id="status"></p>
+
+  <div id="result" hidden>
+    <video id="preview" controls playsinline></video>
+    <label>اسم الملف قبل التنزيل
+      <input type="text" id="name" value="video">
+    </label>
+    <button id="dl">⬇️ تنزيل</button>
+    <p id="sizes"></p>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const mainFile = $('mainFile'), extraFile = $('extraFile'), cutEl = $('cut');
+const startBtn = $('startBtn'), bar = $('bar'), statusEl = $('status');
+const AUDIO_BR = 128000;
+
+let ffmpeg = null, logBuf = '', outBlob = null;
+
+extraFile.addEventListener('change', () => {
+  const f = extraFile.files[0];
+  $('imgDurBox').hidden = !(f && f.type.startsWith('image/'));
+});
+
+const setStatus = t => statusEl.textContent = t;
+
+async function getFF() {
+  if (ffmpeg) return ffmpeg;
+  const { FFmpeg } = FFmpegWASM;
+  const { toBlobURL } = FFmpegUtil;
+  ffmpeg = new FFmpeg();
+  ffmpeg.on('log', ({ message }) => { logBuf += message + '\n'; });
+  ffmpeg.on('progress', ({ progress }) => {
+    if (progress >= 0 && progress <= 1) bar.value = progress;
+  });
+  await ffmpeg.load({
+    coreURL: await toBlobURL('ffmpeg/ffmpeg-core.js', 'text/javascript'),
+    wasmURL: await toBlobURL('ffmpeg/ffmpeg-core.wasm', 'application/wasm'),
+    classWorkerURL: await toBlobURL('ffmpeg/814.ffmpeg.js', 'text/javascript')
+  });
+  return ffmpeg;
+}
+
+function videoMeta(file) {
+  return new Promise((res, rej) => {
+    const v = document.createElement('video');
+    v.preload = 'metadata';
+    v.onloadedmetadata = () => {
+      const m = { duration: v.duration, w: v.videoWidth, h: v.videoHeight };
+      URL.revokeObjectURL(v.src);
+      res(m);
+    };
+    v.onerror = () => rej(new Error('تعذّر قراءة الفيديو'));
+    v.src = URL.createObjectURL(file);
+  });
+}
+
+function imageMeta(file) {
+  return new Promise((res, rej) => {
+    const i = new Image();
+    i.onload = () => { res({ w: i.naturalWidth, h: i.naturalHeight }); URL.revokeObjectURL(i.src); };
+    i.onerror = () => rej(new Error('تعذّر قراءة الصورة'));
+    i.src = URL.createObjectURL(file);
+  });
+}
+
+const getExt = (f, fallback) => {
+  const e = (f.name.split('.').pop() || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  return e || fallback;
+};
+
+async function probe(ff, name) {
+  logBuf = '';
+  try { await ff.exec(['-i', name]); } catch (e) {}
+  const l = logBuf;
+  const fpsM = l.match(/, (\d+(?:\.\d+)?) fps/);
+  let fps = fpsM ? parseFloat(fpsM[1]) : 30;
+  if (!(fps > 0) || fps > 60) fps = Math.min(fps || 30, 60);
+  return { audio: /Stream #[^\n]*Audio:/.test(l), fps: +fps.toFixed(3) };
+}
+
+startBtn.addEventListener('click', async () => {
+  const file = mainFile.files[0];
+  if (!file) return setStatus('اختر فيديو أولًا');
+  const cut = parseFloat(cutEl.value);
+  if (!(cut >= 2 && cut <= 10)) return setStatus('اكتب رقم بين 2 و 10');
+
+  startBtn.disabled = true;
+  $('result').hidden = true;
+  bar.hidden = false; bar.value = 0;
+  const created = [];
+
+  try {
+    const meta = await videoMeta(file);
+    if (cut >= meta.duration) throw new Error('المدة المحذوفة أكبر من طول الفيديو');
+    const keep = meta.duration - cut;
+
+    setStatus('جارٍ تحميل المحرّك...');
+    const ff = await getFF();
+    const { fetchFile } = FFmpegUtil;
+
+    setStatus('جارٍ قراءة الملفات...');
+    const inMain = 'in0.' + getExt(file, 'mp4');
+    await ff.writeFile(inMain, await fetchFile(file)); created.push(inMain);
+    const pm = await probe(ff, inMain);
+
+    // نفس معدل البت تقريبًا => نفس الحجم والجودة تقريبًا
+    const totalBps = file.size * 8 / meta.duration;
+    const vbr = Math.max(300000, totalBps - (pm.audio ? AUDIO_BR : 0));
+    const vk = Math.round(vbr / 1000);
+    const rate = ['-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+      '-b:v', vk + 'k', '-maxrate', Math.round(vk * 1.5) + 'k', '-bufsize', (vk * 2) + 'k'];
+    const audioEnc = ['-c:a', 'aac', '-b:a', '128k'];
+
+    const extra = extraFile.files[0];
+    let args;
+
+    if (!extra) {
+      args = ['-t', keep.toFixed(3), '-i', inMain, ...rate, ...(pm.audio ? audioEnc : ['-an']),
+        '-movflags', '+faststart', 'out.mp4'];
+    } else {
+      const isImg = extra.type.startsWith('image/');
+      const inExtra = 'in1.' + getExt(extra, isImg ? 'png' : 'mp4');
+      await ff.writeFile(inExtra, await fetchFile(extra)); created.push(inExtra);
+
+      const W = meta.w - (meta.w % 2), H = meta.h - (meta.h % 2);
+      const fps = pm.fps;
+      let extraDur, extraAudio = false, inputs;
+
+      if (isImg) {
+        extraDur = Math.max(1, parseFloat($('imgDur').value) || 3);
+        inputs = ['-t', keep.toFixed(3), '-i', inMain,
+                  '-loop', '1', '-framerate', String(fps), '-t', extraDur.toFixed(3), '-i', inExtra];
+      } else {
+        const em = await videoMeta(extra);
+        extraDur = em.duration;
+        extraAudio = (await probe(ff, inExtra)).audio;
+        inputs = ['-t', keep.toFixed(3), '-i', inMain, '-i', inExtra];
+      }
+
+      const useAudio = pm.audio || extraAudio;
+      const segV = (i, l) => `[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps},format=yuv420p,setpts=PTS-STARTPTS[${l}]`;
+      const segA = (i, l, has, d) => has
+        ? `[${i}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[${l}]`
+        : `anullsrc=r=44100:cl=stereo,atrim=0:${d.toFixed(3)},asetpts=PTS-STARTPTS[${l}]`;
+
+      const parts = [segV(0, 'v0'), segV(1, 'v1')];
+      if (useAudio) {
+        parts.push(segA(0, 'a0', pm.audio, keep), segA(1, 'a1', extraAudio, extraDur));
+        parts.push('[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]');
+      } else {
+        parts.push('[v0][v1]concat=n=2:v=1:a=0[v]');
+      }
+
+      args = [...inputs, '-filter_complex', parts.join(';'), '-map', '[v]',
+        ...(useAudio ? ['-map', '[a]', ...audioEnc] : ['-an']),
+        ...rate, '-movflags', '+faststart', 'out.mp4'];
+    }
+
+    setStatus('جارٍ المعالجة... (قد تستغرق بعض الوقت)');
+    bar.value = 0;
+    const code = await ff.exec(args);
+    if (code !== 0) throw new Error('فشلت المعالجة');
+    created.push('out.mp4');
+
+    const data = await ff.readFile('out.mp4');
+    outBlob = new Blob([data.buffer], { type: 'video/mp4' });
+
+    const prev = $('preview');
+    if (prev.src) URL.revokeObjectURL(prev.src);
+    prev.src = URL.createObjectURL(outBlob);
+
+    const mb = b => (b / 1048576).toFixed(2) + ' MB';
+    $('sizes').textContent = `الحجم الأصلي: ${mb(file.size)} ← الناتج: ${mb(outBlob.size)}`;
+    $('name').value = file.name.replace(/\.[^.]+$/, '') + '-edited';
+    $('result').hidden = false;
+    bar.value = 1;
+    setStatus('تم ✅ اكتب الاسم ثم نزّل الملف');
+  } catch (e) {
+    console.error(e);
+    setStatus('❌ ' + (e.message || 'حدث خطأ'));
+  } finally {
+    for (const n of created) { try { await ffmpeg.deleteFile(n); } catch (e) {} }
+    startBtn.disabled = false;
+  }
+});
+
+$('dl').addEventListener('click', async () => {
+  if (!outBlob) return;
+  const n = ($('name').value.trim().replace(/[\\/:*?"<>|]/g, '') || 'video') + '.mp4';
+  const cap = window.Capacitor;
+
+  if (cap && cap.isNativePlatform && cap.isNativePlatform()) {
+    try {
+      setStatus('جارٍ تجهيز الملف...');
+      const b64 = await new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload = () => res(r.result.split(',')[1]);
+        r.onerror = rej;
+        r.readAsDataURL(outBlob);
+      });
+      const { Filesystem, Share } = cap.Plugins;
+      const f = await Filesystem.writeFile({ path: n, data: b64, directory: 'CACHE' });
+      await Share.share({ title: n, files: [f.uri] });
+      setStatus('تم ✅');
+    } catch (e) {
+      console.error(e);
+      setStatus('❌ ' + (e.message || 'فشل الحفظ'));
+    }
+    return;
+  }
+
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(outBlob);
+  a.download = n;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+});
+</script>
+</body>
+</html>
